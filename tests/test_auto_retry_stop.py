@@ -11,12 +11,19 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "plugins" / "codex-auto-retry" / "scripts" / "auto_retry_stop.py"
+HOOKS = ROOT / "plugins" / "codex-auto-retry" / "hooks" / "hooks.json"
 sys.path.insert(0, str(SCRIPT.parent))
 
 import auto_retry_stop  # noqa: E402
 
 
 class AutoRetryHookTests(unittest.TestCase):
+    def test_hook_config_uses_plugin_root(self) -> None:
+        payload = json.loads(HOOKS.read_text(encoding="utf-8"))
+        hook = payload["hooks"]["Stop"][0]["hooks"][0]
+        self.assertIn("PLUGIN_ROOT", hook["command"])
+        self.assertIn("$env:PLUGIN_ROOT", hook["commandWindows"])
+
     def test_detects_high_demand(self) -> None:
         detection = auto_retry_stop.classify_retryable_error(
             "We're currently experiencing high demand, which may cause temporary errors."

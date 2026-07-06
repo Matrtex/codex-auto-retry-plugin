@@ -23,7 +23,7 @@ Codex Auto Retry 是一个本地 Codex 插件，用 `Stop` hook 检测临时性 
 
 ## 工作原理
 
-插件注册一个 `Stop` hook：
+插件注册一个 `Stop` hook。配置位于默认 hook 路径 `plugins/codex-auto-retry/hooks/hooks.json`：
 
 ```json
 {
@@ -34,7 +34,9 @@ Codex Auto Retry 是一个本地 Codex 插件，用 `Stop` hook 检测临时性 
         "hooks": [
           {
             "type": "command",
-            "command": "python ./scripts/auto_retry_stop.py"
+            "command": "python3 \"$PLUGIN_ROOT/scripts/auto_retry_stop.py\"",
+            "commandWindows": "py -3 ([System.IO.Path]::Combine($env:PLUGIN_ROOT, 'scripts', 'auto_retry_stop.py'))",
+            "timeout": 120
           }
         ]
       }

@@ -4,7 +4,7 @@
 
 核心脚本：`scripts/auto_retry_stop.py`
 
-hook 配置：`hooks.json`
+hook 配置：`hooks/hooks.json`
 
 主要能力：
 

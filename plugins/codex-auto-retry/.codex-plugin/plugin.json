@@ -1,6 +1,6 @@
 {
   "name": "codex-auto-retry",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Codex Stop hook plugin that retries transient high-demand, rate-limit, server, and network failures.",
   "author": {
     "name": "Matrtex",
