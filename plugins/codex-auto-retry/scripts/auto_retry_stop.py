@@ -123,6 +123,10 @@ RETRYABLE_PATTERNS: list[tuple[str, str, list[str]]] = [
 ]
 
 NON_RETRYABLE_PATTERNS: list[str] = [
+    r"\bturn_aborted\b",
+    r"\buser interrupted\b",
+    r"\bthe user interrupted\b",
+    r"\binterrupted the previous turn on purpose\b",
     r"\b400\b",
     r"\b401\b",
     r"\b403\b",
@@ -173,6 +177,20 @@ SERVICE_CONTEXT_REQUIRED = {
     "temporary_error",
 }
 
+CONTROL_EVENT_TYPES = {
+    "hook_prompt",
+    "user_message",
+    "user_input",
+    "turn_aborted",
+}
+
+SELF_RETRY_PATTERNS: list[str] = [
+    r"Codex Auto Retry 检测到临时性模型/服务错误",
+    r"请直接重试上一条用户请求",
+    r"hook_run_id=.*codex-auto-retry",
+    r"<hook_prompt\b",
+]
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except AttributeError:
@@ -207,6 +225,26 @@ def has_any(patterns: list[str], text: str) -> bool:
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns)
 
 
+def is_self_retry_text(text: str) -> bool:
+    return has_any(SELF_RETRY_PATTERNS, text)
+
+
+def is_control_event(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+
+    role = str(value.get("role", "")).lower()
+    event_type = str(value.get("type", "")).lower()
+    if role == "user" or event_type in CONTROL_EVENT_TYPES or "hook" in event_type:
+        return True
+
+    try:
+        serialized = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return False
+    return is_self_retry_text(serialized)
+
+
 def make_snippet(text: str, match: re.Match[str], radius: int = 180) -> str:
     start = max(0, match.start() - radius)
     end = min(len(text), match.end() + radius)
@@ -236,6 +274,8 @@ def collect_strings(value: Any, *, parent_key: str = "") -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
+        if is_self_retry_text(value):
+            return []
         if parent_key.lower() in {"content", "text", "message", "error", "reason", "status", "type"}:
             return [value]
         return []
@@ -245,9 +285,7 @@ def collect_strings(value: Any, *, parent_key: str = "") -> list[str]:
             result.extend(collect_strings(item, parent_key=parent_key))
         return result
     if isinstance(value, dict):
-        role = str(value.get("role", "")).lower()
-        event_type = str(value.get("type", "")).lower()
-        if role == "user" or event_type in {"user_message", "user_input"}:
+        if is_control_event(value):
             return []
         result: list[str] = []
         for key, item in value.items():
@@ -276,7 +314,7 @@ def extract_transcript_text(transcript_path: str | None, tail_limit: int) -> str
     except OSError:
         return ""
 
-    fragments: list[str] = []
+    parsed_lines: list[Any] = []
     for line in tail.splitlines()[-120:]:
         stripped = line.strip()
         if not stripped:
@@ -284,10 +322,24 @@ def extract_transcript_text(transcript_path: str | None, tail_limit: int) -> str
         try:
             payload = json.loads(stripped)
         except json.JSONDecodeError:
-            if re.search(r"\b(error|failed|retry|429|5\d\d|high demand)\b", stripped, re.IGNORECASE):
-                fragments.append(stripped)
+            parsed_lines.append(stripped)
             continue
-        fragments.extend(collect_strings(payload))
+        parsed_lines.append(payload)
+
+    last_control_index = -1
+    for index, item in enumerate(parsed_lines):
+        if is_control_event(item):
+            last_control_index = index
+
+    fragments: list[str] = []
+    for item in parsed_lines[last_control_index + 1 :]:
+        if isinstance(item, str):
+            if is_self_retry_text(item):
+                continue
+            if re.search(r"\b(error|failed|retry|429|5\d\d|high demand)\b", item, re.IGNORECASE):
+                fragments.append(item)
+            continue
+        fragments.extend(collect_strings(item))
 
     return "\n".join(fragment for fragment in fragments if fragment)
 
@@ -410,12 +462,13 @@ def main() -> int:
         return 0
 
     last_message = str(payload.get("last_assistant_message") or "")
-    transcript_text = extract_transcript_text(
-        payload.get("transcript_path"),
-        env_int("CODEX_AUTO_RETRY_TRANSCRIPT_TAIL_BYTES", DEFAULT_TRANSCRIPT_TAIL_BYTES),
-    )
-    candidate_text = "\n".join(part for part in [last_message, transcript_text] if part)
-    detection = classify_retryable_error(candidate_text)
+    detection = classify_retryable_error(last_message)
+    if detection is None and not last_message.strip():
+        transcript_text = extract_transcript_text(
+            payload.get("transcript_path"),
+            env_int("CODEX_AUTO_RETRY_TRANSCRIPT_TAIL_BYTES", DEFAULT_TRANSCRIPT_TAIL_BYTES),
+        )
+        detection = classify_retryable_error(transcript_text)
     if detection is None:
         return 0
 

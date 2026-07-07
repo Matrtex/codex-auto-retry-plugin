@@ -87,6 +87,102 @@ class AutoRetryHookTests(unittest.TestCase):
             text = auto_retry_stop.extract_transcript_text(str(transcript), 1024)
             self.assertNotIn("high demand", text.lower())
 
+    def test_transcript_skips_auto_retry_hook_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "hook_prompt",
+                        "hook_run_id": "stop:0:/plugins/codex-auto-retry/hooks/hooks.json",
+                        "content": (
+                            "Codex Auto Retry 检测到临时性模型/服务错误："
+                            "上游服务错误 (server_error)，自动重试 4/5。"
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+                + json.dumps({"role": "assistant", "content": "正常完成。"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+            text = auto_retry_stop.extract_transcript_text(str(transcript), 4096)
+            self.assertNotIn("server_error", text)
+            self.assertNotIn("Codex Auto Retry", text)
+
+    def test_last_message_ignores_stale_transcript_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "role": "assistant",
+                        "content": "Codex model provider error: 503 service unavailable.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["CODEX_AUTO_RETRY_STATE_DIR"] = temp_dir
+            env["CODEX_AUTO_RETRY_DISABLE_SLEEP"] = "1"
+            payload = {
+                "session_id": "test-session",
+                "hook_event_name": "Stop",
+                "last_assistant_message": "正常完成。",
+                "transcript_path": str(transcript),
+            }
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT)],
+                input=json.dumps(payload),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=True,
+                env=env,
+            )
+            self.assertEqual(result.stdout, "")
+
+    def test_empty_last_message_uses_recent_transcript_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            transcript.write_text(
+                json.dumps({"role": "user", "content": "Run the task."})
+                + "\n"
+                + json.dumps(
+                    {
+                        "role": "assistant",
+                        "content": "Codex model provider error: 503 service unavailable.",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["CODEX_AUTO_RETRY_STATE_DIR"] = temp_dir
+            env["CODEX_AUTO_RETRY_DISABLE_SLEEP"] = "1"
+            env["CODEX_AUTO_RETRY_JITTER"] = "0"
+            payload = {
+                "session_id": "test-session",
+                "hook_event_name": "Stop",
+                "last_assistant_message": "",
+                "transcript_path": str(transcript),
+            }
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT)],
+                input=json.dumps(payload),
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=True,
+                env=env,
+            )
+            output = json.loads(result.stdout)
+            self.assertEqual(output["decision"], "block")
+
     def test_hook_outputs_block_decision(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env = os.environ.copy()
