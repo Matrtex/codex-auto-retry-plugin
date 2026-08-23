@@ -7,7 +7,8 @@
             "type": "command",
             "command": "python3 \"$PLUGIN_ROOT/scripts/auto_retry_stop.py\"",
             "commandWindows": "py -3 ([System.IO.Path]::Combine($env:PLUGIN_ROOT, 'scripts', 'auto_retry_stop.py'))",
-            "timeout": 120
+            "timeout": 120,
+            "statusMessage": "正在检查可安全续跑的临时模型错误"
           }
         ]
       }

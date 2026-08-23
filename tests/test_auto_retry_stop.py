@@ -1,237 +1,780 @@
 from __future__ import annotations
 
+import concurrent.futures
+import contextlib
+import io
 import json
+import math
 import os
+import re
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SCRIPT = ROOT / "plugins" / "codex-auto-retry" / "scripts" / "auto_retry_stop.py"
-HOOKS = ROOT / "plugins" / "codex-auto-retry" / "hooks" / "hooks.json"
+PLUGIN = ROOT / "plugins" / "codex-auto-retry"
+SCRIPT = PLUGIN / "scripts" / "auto_retry_stop.py"
+HOOKS = PLUGIN / "hooks" / "hooks.json"
+MANIFEST = PLUGIN / ".codex-plugin" / "plugin.json"
+MARKETPLACE = ROOT / ".agents" / "plugins" / "marketplace.json"
 sys.path.insert(0, str(SCRIPT.parent))
 
 import auto_retry_stop  # noqa: E402
 
 
-class AutoRetryHookTests(unittest.TestCase):
-    def test_hook_config_uses_plugin_root(self) -> None:
-        payload = json.loads(HOOKS.read_text(encoding="utf-8"))
-        hook = payload["hooks"]["Stop"][0]["hooks"][0]
-        self.assertIn("PLUGIN_ROOT", hook["command"])
-        self.assertIn("$env:PLUGIN_ROOT", hook["commandWindows"])
+RETRY_ENV_VARS = {
+    "CODEX_AUTO_RETRY_MAX_ATTEMPTS",
+    "CODEX_AUTO_RETRY_BASE_DELAY",
+    "CODEX_AUTO_RETRY_MAX_DELAY",
+    "CODEX_AUTO_RETRY_BACKOFF_FACTOR",
+    "CODEX_AUTO_RETRY_JITTER",
+    "CODEX_AUTO_RETRY_STATE_TTL_SECONDS",
+    "CODEX_AUTO_RETRY_STATE_DIR",
+    "CODEX_AUTO_RETRY_MESSAGE_SCAN_CHARS",
+    "CODEX_AUTO_RETRY_TRANSCRIPT_FALLBACK",
+    "CODEX_AUTO_RETRY_TRANSCRIPT_TAIL_BYTES",
+    "CODEX_AUTO_RETRY_DISABLE_SLEEP",
+    "PLUGIN_DATA",
+    "CLAUDE_PLUGIN_DATA",
+}
 
-    def test_detects_high_demand(self) -> None:
-        detection = auto_retry_stop.classify_retryable_error(
-            "We're currently experiencing high demand, which may cause temporary errors."
-        )
-        self.assertIsNotNone(detection)
-        self.assertEqual(detection.category, "high_demand")
 
-    def test_detects_rate_limit(self) -> None:
-        detection = auto_retry_stop.classify_retryable_error(
-            "OpenAI API request failed with 429: rate_limit_exceeded. Retry-After: 15."
-        )
-        self.assertIsNotNone(detection)
-        self.assertEqual(detection.category, "rate_limit")
+def latest_stop_payload(**updates: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "session_id": "session-0.149",
+        "turn_id": "turn-0.149",
+        "transcript_path": None,
+        "cwd": str(ROOT),
+        "hook_event_name": "Stop",
+        "model": "gpt-5.6",
+        "permission_mode": "default",
+        "stop_hook_active": False,
+        "last_assistant_message": "Codex model provider error: 503 service unavailable from upstream.",
+    }
+    payload.update(updates)
+    return payload
 
-    def test_detects_server_error(self) -> None:
-        detection = auto_retry_stop.classify_retryable_error(
-            "Codex model provider error: 503 service unavailable from upstream server."
-        )
-        self.assertIsNotNone(detection)
-        self.assertEqual(detection.category, "server_error")
 
-    def test_detects_stream_error_with_service_context(self) -> None:
-        detection = auto_retry_stop.classify_retryable_error(
-            "Codex response stream interrupted after the upstream request started."
-        )
-        self.assertIsNotNone(detection)
-        self.assertEqual(detection.category, "stream_error")
+def hook_environment(state_dir: str | Path, **updates: str) -> dict[str, str]:
+    env = os.environ.copy()
+    for name in RETRY_ENV_VARS:
+        env.pop(name, None)
+    env.update(
+        {
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            "CODEX_AUTO_RETRY_STATE_DIR": str(state_dir),
+            "CODEX_AUTO_RETRY_DISABLE_SLEEP": "1",
+            "CODEX_AUTO_RETRY_JITTER": "0",
+        }
+    )
+    env.update(updates)
+    return env
 
-    def test_ignores_project_timeout_without_service_context(self) -> None:
-        detection = auto_retry_stop.classify_retryable_error(
-            "The local pytest command timed out while waiting for the application server."
-        )
-        self.assertIsNone(detection)
 
-    def test_ignores_non_retryable_errors(self) -> None:
+def run_hook(
+    payload: object,
+    state_dir: str | Path,
+    *,
+    raw_input: str | None = None,
+    env_updates: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    env = hook_environment(state_dir, **(env_updates or {}))
+    input_text = raw_input if raw_input is not None else json.dumps(payload, ensure_ascii=False)
+    return subprocess.run(
+        [sys.executable, str(SCRIPT)],
+        input=input_text,
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        check=False,
+        timeout=60,
+        env=env,
+    )
+
+
+def output_attempt(result: subprocess.CompletedProcess[str]) -> int | None:
+    if not result.stdout:
+        return None
+    output = json.loads(result.stdout)
+    match = re.search(r"安全续跑 (\d+)/(\d+)", output["reason"])
+    if not match:
+        raise AssertionError(f"输出缺少尝试次数：{output}")
+    return int(match.group(1))
+
+
+class DetectionTests(unittest.TestCase):
+    def test_detects_supported_provider_failures(self) -> None:
+        samples = {
+            "high_demand": "We're currently experiencing high demand, which may cause temporary errors.",
+            "rate_limit": "OpenAI API request failed with 429: rate_limit_exceeded. Retry-After: 15.",
+            "server_error": "Codex model provider error: 503 service unavailable from upstream.",
+            "stream_error": "stream disconnected before completion: response.completed was not received",
+            "network_error": "OpenAI model provider request failed with ECONNRESET.",
+            "temporary_error": "OpenAI model provider returned a transient error; please retry.",
+        }
+        for category, sample in samples.items():
+            with self.subTest(category=category):
+                detection = auto_retry_stop.classify_retryable_error(sample)
+                self.assertIsNotNone(detection)
+                self.assertEqual(detection.category, category)
+
+    def test_ignores_permanent_failures(self) -> None:
         samples = [
             "OpenAI API invalid_api_key: incorrect API key provided.",
-            "OpenAI API insufficient_quota: billing quota exceeded.",
+            "OpenAI API 429 rate_limit_exceeded and insufficient_quota.",
+            "OpenAI API authentication failed with status 401.",
             "Codex failed because the prompt exceeded the maximum context length.",
+            "OpenAI model not found: status 404.",
             "The request was blocked by a content policy violation.",
+            "The user interrupted the previous turn on purpose.",
         ]
         for sample in samples:
             with self.subTest(sample=sample):
                 self.assertIsNone(auto_retry_stop.classify_retryable_error(sample))
 
-    def test_transcript_skips_user_prompt_false_positive(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            transcript = Path(temp_dir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "role": "user",
-                        "content": "Can you handle We're currently experiencing high demand?",
-                    }
-                )
-                + "\n"
-                + json.dumps({"role": "assistant", "content": "Done."})
-                + "\n",
-                encoding="utf-8",
-            )
-            text = auto_retry_stop.extract_transcript_text(str(transcript), 1024)
-            self.assertNotIn("high demand", text.lower())
+    def test_ignores_explanations_and_project_errors(self) -> None:
+        samples = [
+            "OpenAI API 429 表示限流，以下是排查方法。",
+            "HTTP 503 means service unavailable; for example, retry with backoff.",
+            "文档示例：We're currently experiencing high demand, which may cause temporary errors.",
+            "The checkout service is overloaded. Please retry the local request.",
+            "The local pytest command timed out while waiting for the application server.",
+            "Our integration test contains an OpenAI 429 example in a code block.",
+            "OpenAI returns HTTP 429 when rate limits are exceeded.",
+            "Codex may return 503 during maintenance.",
+            "The exact provider message is: We're currently experiencing high demand, which may cause temporary errors.",
+            "Codex error handling should back off after HTTP 429.",
+            "OpenAI request failed with 429 is one possible error string.",
+            "stream disconnected before completion is emitted when Codex closes an SSE stream early.",
+            "OpenAI high demand periods can cause temporary errors.",
+            "Codex is often overloaded at peak hours.",
+            "OpenAI provider error 503 can occur during maintenance.",
+            "OpenAI provider error 503 should be handled with backoff.",
+            "OpenAI rate_limit_exceeded error can be mitigated by retrying.",
+            "Error: OpenAI 429. To resolve it, use exponential backoff.",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertIsNone(auto_retry_stop.classify_retryable_error(sample))
 
-    def test_transcript_skips_auto_retry_hook_prompt(self) -> None:
+    def test_retry_after_is_parsed_without_premature_truncation(self) -> None:
+        detection = auto_retry_stop.classify_retryable_error(
+            "OpenAI API request failed with 429 rate_limit_exceeded. Retry-After: 15.5"
+        )
+        self.assertIsNotNone(detection)
+        self.assertEqual(detection.retry_after_seconds, 15.5)
+        self.assertEqual(auto_retry_stop.parse_retry_after("Retry-After: 999999"), 999999.0)
+
+    def test_detects_natural_language_errors_with_trailing_provider_context(self) -> None:
+        samples = {
+            "rate_limit": [
+                "Error: too many requests from the OpenAI provider.",
+                "Error: throttled by the OpenAI Responses API.",
+                "Error: rate limited by model provider.",
+            ],
+            "server_error": [
+                "Error: service unavailable from OpenAI provider.",
+                "Error: bad gateway returned by the model provider.",
+            ],
+            "network_error": [
+                "Error: TLS handshake failed while contacting OpenAI provider.",
+                "Error: DNS lookup failed for api.openai.com.",
+                "Error: request timed out while waiting for the OpenAI provider.",
+                "Error: fetch failed while calling the OpenAI Responses API.",
+            ],
+            "stream_error": [
+                "Error: stream interrupted while reading from the OpenAI provider.",
+                "Error: response was truncated by the OpenAI upstream.",
+                "Error: failed to stream a response from the model provider.",
+            ],
+            "temporary_error": [
+                "Error: temporary failure from the OpenAI provider.",
+                "Error: transient error from model provider.",
+            ],
+        }
+        for category, category_samples in samples.items():
+            for sample in category_samples:
+                with self.subTest(category=category, sample=sample):
+                    detection = auto_retry_stop.classify_retryable_error(sample)
+                    self.assertIsNotNone(detection)
+                    self.assertEqual(detection.category, category)
+
+    def test_latency_numbers_do_not_suppress_real_server_errors(self) -> None:
+        for sample in (
+            "Codex model provider error: 503 service unavailable after 400 ms.",
+            "Codex model provider error: 503 service unavailable; request took 404 ms.",
+        ):
+            with self.subTest(sample=sample):
+                detection = auto_retry_stop.classify_retryable_error(sample)
+                self.assertIsNotNone(detection)
+                self.assertEqual(detection.category, "server_error")
+
+    def test_strong_runtime_errors_can_include_followup_guidance(self) -> None:
+        samples = [
+            "OpenAI API request failed with 429 rate_limit_exceeded. See documentation for retry guidance.",
+            "Codex model provider error: 503 service unavailable. See documentation.",
+            "Provider error: 503 service unavailable; this indicates a temporary outage.",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertIsNotNone(auto_retry_stop.classify_retryable_error(sample))
+
+
+class PayloadAndTurnTests(unittest.TestCase):
+    def test_latest_stop_payload_outputs_valid_block_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(latest_stop_payload(), temp_dir)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        output = json.loads(result.stdout)
+        self.assertEqual(output["decision"], "block")
+        self.assertEqual(output_attempt(result), 1)
+
+    def test_same_turn_shares_budget_across_continuations_and_error_changes(self) -> None:
+        messages = [
+            "We're currently experiencing high demand, which may cause temporary errors.",
+            "OpenAI API request failed with 429 rate_limit_exceeded.",
+            "Codex model provider error: 503 service unavailable.",
+            "stream disconnected before completion: response.completed was not received",
+        ]
+        active_values = [False, True, True, True]
+        attempts: list[int | None] = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for message, active in zip(messages, active_values):
+                result = run_hook(
+                    latest_stop_payload(
+                        turn_id="same-turn",
+                        stop_hook_active=active,
+                        last_assistant_message=message,
+                    ),
+                    temp_dir,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                attempts.append(output_attempt(result))
+        self.assertEqual(attempts, [1, 2, 3, None])
+
+    def test_different_turns_and_sessions_have_independent_budgets(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            first = run_hook(latest_stop_payload(session_id="s1", turn_id="t1"), temp_dir)
+            second_turn = run_hook(latest_stop_payload(session_id="s1", turn_id="t2"), temp_dir)
+            second_session = run_hook(latest_stop_payload(session_id="s2", turn_id="t1"), temp_dir)
+        self.assertEqual([output_attempt(first), output_attempt(second_turn), output_attempt(second_session)], [1, 1, 1])
+
+    def test_active_continuation_without_state_does_not_reset_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(
+                latest_stop_payload(stop_hook_active=True),
+                temp_dir,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_legacy_payload_without_new_turn_fields_remains_best_effort_compatible(self) -> None:
+        payload = {
+            "session_id": "legacy-session",
+            "hook_event_name": "Stop",
+            "last_assistant_message": "Codex model provider error: 503 service unavailable.",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(payload, temp_dir)
+        self.assertEqual(output_attempt(result), 1)
+
+    def test_invalid_payloads_fail_open_without_stdout(self) -> None:
+        invalid_cases: list[tuple[object, str | None]] = [
+            ([], None),
+            (None, None),
+            ("text", None),
+            ({"hook_event_name": "Stop"}, None),
+            (latest_stop_payload(stop_hook_active="false"), None),
+            (latest_stop_payload(turn_id=123), None),
+            (latest_stop_payload(last_assistant_message={"error": "503"}), None),
+            (latest_stop_payload(hook_event_name="SessionEnd"), None),
+            ({**latest_stop_payload(), "turn_id": ""}, None),
+            ({}, "{truncated"),
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            for payload, raw_input in invalid_cases:
+                with self.subTest(payload=payload, raw_input=raw_input):
+                    result = run_hook(payload, temp_dir, raw_input=raw_input)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, "")
+                    self.assertEqual(result.stderr, "")
+
+    def test_zero_attempts_disables_continuation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(
+                latest_stop_payload(),
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_MAX_ATTEMPTS": "0"},
+            )
+        self.assertEqual(result.stdout, "")
+
+    def test_retry_after_above_delay_cap_stops_instead_of_retrying_early(self) -> None:
+        payload = latest_stop_payload(
+            last_assistant_message=(
+                "OpenAI API request failed with 429 rate_limit_exceeded. Retry-After: 90"
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(payload, temp_dir)
+            self.assertEqual(result.stdout, "")
+            self.assertFalse((Path(temp_dir) / "state-v2.sqlite3").exists())
+
+            allowed = run_hook(
+                payload,
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_MAX_DELAY": "100"},
+            )
+        self.assertEqual(output_attempt(allowed), 1)
+        self.assertIn("已等待 90.0 秒", json.loads(allowed.stdout)["reason"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            above_hard_cap = run_hook(
+                latest_stop_payload(
+                    last_assistant_message=(
+                        "OpenAI API request failed with 429 rate_limit_exceeded. Retry-After: 116"
+                    )
+                ),
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_MAX_DELAY": "999"},
+            )
+        self.assertEqual(above_hard_cap.stdout, "")
+
+    def test_lock_time_can_make_retry_after_unfulfillable(self) -> None:
+        payload = latest_stop_payload(
+            last_assistant_message=(
+                "OpenAI API request failed with 429 rate_limit_exceeded. Retry-After: 90"
+            )
+        )
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_AUTO_RETRY_STATE_DIR": temp_dir,
+                "CODEX_AUTO_RETRY_DISABLE_SLEEP": "1",
+                "CODEX_AUTO_RETRY_JITTER": "0",
+                "CODEX_AUTO_RETRY_MAX_DELAY": "100",
+            },
+            clear=False,
+        ), mock.patch.object(
+            auto_retry_stop.sys,
+            "stdin",
+            io.StringIO(json.dumps(payload)),
+        ), mock.patch.object(
+            auto_retry_stop.time,
+            "monotonic",
+            side_effect=[0.0, 30.0],
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(auto_retry_stop.main(), 0)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_message_scan_limit_does_not_pick_stale_prefix(self) -> None:
+        message = "Codex model provider error: 503 service unavailable. " + ("正常内容 " * 500)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(
+                latest_stop_payload(last_assistant_message=message),
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_MESSAGE_SCAN_CHARS": "1024"},
+            )
+        self.assertEqual(result.stdout, "")
+
+
+class TranscriptFallbackTests(unittest.TestCase):
+    @staticmethod
+    def write_nested_transcript(path: Path, *, add_latest_success: bool = False) -> None:
+        items: list[dict[str, object]] = [
+            {
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Run the task."},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Codex model provider error: 503 service unavailable.",
+                        }
+                    ],
+                },
+            },
+        ]
+        if add_latest_success:
+            items.append(
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "任务已正常完成。"}],
+                    },
+                }
+            )
+        path.write_text(
+            "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + "\n",
+            encoding="utf-8",
+        )
+
+    def test_transcript_fallback_is_disabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            self.write_nested_transcript(transcript)
+            result = run_hook(
+                latest_stop_payload(last_assistant_message=None, transcript_path=str(transcript)),
+                temp_dir,
+            )
+        self.assertEqual(result.stdout, "")
+
+    def test_enabled_fallback_parses_latest_nested_envelopes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            self.write_nested_transcript(transcript)
+            result = run_hook(
+                latest_stop_payload(last_assistant_message=None, transcript_path=str(transcript)),
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_TRANSCRIPT_FALLBACK": "1"},
+            )
+        self.assertEqual(output_attempt(result), 1)
+
+    def test_fallback_uses_latest_event_and_ignores_stale_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            self.write_nested_transcript(transcript, add_latest_success=True)
+            result = run_hook(
+                latest_stop_payload(last_assistant_message="", transcript_path=str(transcript)),
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_TRANSCRIPT_FALLBACK": "1"},
+            )
+        self.assertEqual(result.stdout, "")
+
+    def test_nonempty_last_message_never_uses_stale_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            self.write_nested_transcript(transcript)
+            result = run_hook(
+                latest_stop_payload(last_assistant_message="任务已正常完成。", transcript_path=str(transcript)),
+                temp_dir,
+                env_updates={"CODEX_AUTO_RETRY_TRANSCRIPT_FALLBACK": "1"},
+            )
+        self.assertEqual(result.stdout, "")
+
+    def test_tail_discards_partial_line_and_malformed_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            transcript = Path(temp_dir) / "transcript.jsonl"
+            prefix = json.dumps({"role": "assistant", "content": "x" * 5000})
+            error = json.dumps(
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "agent_message",
+                        "message": "OpenAI API request failed with 429 rate_limit_exceeded.",
+                    },
+                }
+            )
+            transcript.write_text(prefix + "\n{bad json\n" + error + "\n", encoding="utf-8")
+            extracted = auto_retry_stop.extract_transcript_text(str(transcript), 4096)
+        self.assertIn("rate_limit_exceeded", extracted)
+
+    def test_nested_hook_prompt_is_a_control_boundary(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             transcript = Path(temp_dir) / "transcript.jsonl"
             transcript.write_text(
                 json.dumps(
                     {
-                        "type": "hook_prompt",
-                        "hook_run_id": "stop:0:/plugins/codex-auto-retry/hooks/hooks.json",
-                        "content": (
-                            "Codex Auto Retry 检测到临时性模型/服务错误："
-                            "上游服务错误 (server_error)，自动重试 4/5。"
-                        ),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "hook_prompt",
+                            "message": "Codex Auto Retry 在 Stop 可见消息中识别到临时错误",
+                        },
                     },
                     ensure_ascii=False,
                 )
                 + "\n"
-                + json.dumps({"role": "assistant", "content": "正常完成。"}, ensure_ascii=False)
-                + "\n",
-                encoding="utf-8",
-            )
-            text = auto_retry_stop.extract_transcript_text(str(transcript), 4096)
-            self.assertNotIn("server_error", text)
-            self.assertNotIn("Codex Auto Retry", text)
-
-    def test_last_message_ignores_stale_transcript_error(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            transcript = Path(temp_dir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps(
-                    {
-                        "role": "assistant",
-                        "content": "Codex model provider error: 503 service unavailable.",
-                    }
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["CODEX_AUTO_RETRY_STATE_DIR"] = temp_dir
-            env["CODEX_AUTO_RETRY_DISABLE_SLEEP"] = "1"
-            payload = {
-                "session_id": "test-session",
-                "hook_event_name": "Stop",
-                "last_assistant_message": "正常完成。",
-                "transcript_path": str(transcript),
-            }
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT)],
-                input=json.dumps(payload),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                check=True,
-                env=env,
-            )
-            self.assertEqual(result.stdout, "")
-
-    def test_empty_last_message_uses_recent_transcript_error(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            transcript = Path(temp_dir) / "transcript.jsonl"
-            transcript.write_text(
-                json.dumps({"role": "user", "content": "Run the task."})
-                + "\n"
                 + json.dumps(
                     {
-                        "role": "assistant",
-                        "content": "Codex model provider error: 503 service unavailable.",
-                    }
+                        "type": "response_item",
+                        "payload": {"type": "message", "role": "assistant", "content": "正常完成。"},
+                    },
+                    ensure_ascii=False,
                 )
                 + "\n",
                 encoding="utf-8",
             )
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["CODEX_AUTO_RETRY_STATE_DIR"] = temp_dir
-            env["CODEX_AUTO_RETRY_DISABLE_SLEEP"] = "1"
-            env["CODEX_AUTO_RETRY_JITTER"] = "0"
-            payload = {
-                "session_id": "test-session",
-                "hook_event_name": "Stop",
-                "last_assistant_message": "",
-                "transcript_path": str(transcript),
-            }
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT)],
-                input=json.dumps(payload),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                check=True,
-                env=env,
-            )
-            output = json.loads(result.stdout)
-            self.assertEqual(output["decision"], "block")
+            extracted = auto_retry_stop.extract_transcript_text(str(transcript), 4096)
+        self.assertEqual(extracted, "正常完成。")
 
-    def test_hook_outputs_block_decision(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["CODEX_AUTO_RETRY_STATE_DIR"] = temp_dir
-            env["CODEX_AUTO_RETRY_DISABLE_SLEEP"] = "1"
-            env["CODEX_AUTO_RETRY_JITTER"] = "0"
-            payload = {
-                "session_id": "test-session",
-                "hook_event_name": "Stop",
-                "last_assistant_message": "OpenAI API request failed with 502 bad gateway.",
-            }
-            result = subprocess.run(
-                [sys.executable, str(SCRIPT)],
-                input=json.dumps(payload),
-                text=True,
-                encoding="utf-8",
-                capture_output=True,
-                check=True,
-                env=env,
-            )
-            output = json.loads(result.stdout)
-            self.assertEqual(output["decision"], "block")
-            self.assertIn("自动重试 1/5", output["reason"])
 
-    def test_max_attempts_stops_output(self) -> None:
+class StateAndBackoffTests(unittest.TestCase):
+    def test_sqlite_claim_is_atomic_across_real_processes(self) -> None:
+        payload = latest_stop_payload(session_id="concurrent-session", turn_id="concurrent-turn")
         with tempfile.TemporaryDirectory() as temp_dir:
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["CODEX_AUTO_RETRY_STATE_DIR"] = temp_dir
-            env["CODEX_AUTO_RETRY_DISABLE_SLEEP"] = "1"
-            env["CODEX_AUTO_RETRY_JITTER"] = "0"
-            env["CODEX_AUTO_RETRY_MAX_ATTEMPTS"] = "1"
-            payload = {
-                "session_id": "test-session",
-                "hook_event_name": "Stop",
-                "last_assistant_message": "Codex model provider error: 503 service unavailable.",
-            }
-            for _ in range(2):
-                result = subprocess.run(
-                    [sys.executable, str(SCRIPT)],
-                    input=json.dumps(payload),
-                    text=True,
-                    encoding="utf-8",
-                    capture_output=True,
-                    check=True,
-                    env=env,
+            def invoke(_: int) -> subprocess.CompletedProcess[str]:
+                return run_hook(
+                    payload,
+                    temp_dir,
+                    env_updates={"CODEX_AUTO_RETRY_MAX_ATTEMPTS": "5"},
                 )
-            self.assertEqual(result.stdout, "")
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=24) as executor:
+                results = list(executor.map(invoke, range(24)))
+
+            self.assertTrue(all(result.returncode == 0 for result in results))
+            self.assertTrue(all(result.stderr == "" for result in results))
+            attempts = sorted(attempt for result in results if (attempt := output_attempt(result)) is not None)
+            self.assertEqual(attempts, [1, 2, 3, 4, 5])
+
+            database = Path(temp_dir) / "state-v2.sqlite3"
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                stored_attempts = connection.execute("SELECT attempts FROM retry_records").fetchone()[0]
+            self.assertEqual(stored_attempts, 5)
+
+    def test_state_contains_no_session_turn_or_error_text(self) -> None:
+        payload = latest_stop_payload(
+            session_id="PRIVATE-SESSION-MARKER",
+            turn_id="PRIVATE-TURN-MARKER",
+            last_assistant_message=(
+                "Codex model provider error: 503 service unavailable. PRIVATE-ERROR-MARKER"
+            ),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = run_hook(payload, temp_dir)
+            self.assertEqual(output_attempt(result), 1)
+            database = Path(temp_dir) / "state-v2.sqlite3"
+            raw = database.read_bytes()
+            for marker in (b"PRIVATE-SESSION-MARKER", b"PRIVATE-TURN-MARKER", b"PRIVATE-ERROR-MARKER"):
+                self.assertNotIn(marker, raw)
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                columns = [row[1] for row in connection.execute("PRAGMA table_info(retry_records)")]
+            self.assertEqual(columns, ["scope_hash", "attempts", "first_seen", "last_seen"])
+
+    def test_corrupt_database_fails_open_without_unbounded_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            (Path(temp_dir) / "state-v2.sqlite3").write_bytes(b"not-a-sqlite-database")
+            result = run_hook(latest_stop_payload(), temp_dir)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+
+    def test_semantically_corrupt_attempt_count_fails_closed(self) -> None:
+        detection = auto_retry_stop.classify_retryable_error(
+            "Codex model provider error: 503 service unavailable."
+        )
+        self.assertIsNotNone(detection)
+        scope = auto_retry_stop.retry_scope_hash("session", "turn", detection)
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"CODEX_AUTO_RETRY_STATE_DIR": temp_dir},
+            clear=False,
+        ):
+            self.assertEqual(auto_retry_stop.claim_next_attempt(scope, 3, 300), 1)
+            with contextlib.closing(sqlite3.connect(auto_retry_stop.state_database())) as connection:
+                connection.execute("PRAGMA ignore_check_constraints = ON")
+                connection.execute("UPDATE retry_records SET attempts = -100")
+                connection.commit()
+            self.assertIsNone(
+                auto_retry_stop.claim_next_attempt(scope, 3, 300, allow_create=False)
+            )
+
+    def test_legacy_v2_schema_rejects_non_integer_state_values(self) -> None:
+        detection = auto_retry_stop.classify_retryable_error(
+            "Codex model provider error: 503 service unavailable."
+        )
+        self.assertIsNotNone(detection)
+        scope = auto_retry_stop.retry_scope_hash("session", "turn", detection)
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"CODEX_AUTO_RETRY_STATE_DIR": temp_dir},
+            clear=False,
+        ):
+            database = auto_retry_stop.state_database()
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    """
+                    CREATE TABLE retry_records (
+                        scope_hash TEXT PRIMARY KEY,
+                        attempts INTEGER NOT NULL,
+                        first_seen INTEGER NOT NULL,
+                        last_seen INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    "INSERT INTO retry_records VALUES (?, ?, ?, ?)",
+                    (scope, math.inf, 1, int(auto_retry_stop.time.time())),
+                )
+                connection.commit()
+
+            self.assertIsNone(
+                auto_retry_stop.claim_next_attempt(scope, 3, 300, allow_create=False)
+            )
+
+            with contextlib.closing(sqlite3.connect(database)) as connection:
+                connection.execute(
+                    "UPDATE retry_records SET attempts = ?, first_seen = ?",
+                    (-0.5, "invalid"),
+                )
+                connection.commit()
+            self.assertIsNone(
+                auto_retry_stop.claim_next_attempt(scope, 3, 300, allow_create=False)
+            )
+
+    def test_state_directory_prefers_override_then_plugin_data(self) -> None:
+        with tempfile.TemporaryDirectory() as override, tempfile.TemporaryDirectory() as plugin_data:
+            with mock.patch.dict(os.environ, {"PLUGIN_DATA": plugin_data}, clear=True):
+                self.assertEqual(auto_retry_stop.state_directory(), Path(plugin_data))
+            with mock.patch.dict(
+                os.environ,
+                {"PLUGIN_DATA": plugin_data, "CODEX_AUTO_RETRY_STATE_DIR": override},
+                clear=True,
+            ):
+                self.assertEqual(auto_retry_stop.state_directory(), Path(override))
+
+    def test_active_continuation_cannot_recreate_a_stale_record(self) -> None:
+        detection = auto_retry_stop.classify_retryable_error(
+            "Codex model provider error: 503 service unavailable."
+        )
+        self.assertIsNotNone(detection)
+        scope = auto_retry_stop.retry_scope_hash("session", "turn", detection)
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            os.environ,
+            {"CODEX_AUTO_RETRY_STATE_DIR": temp_dir},
+            clear=False,
+        ):
+            self.assertEqual(auto_retry_stop.claim_next_attempt(scope, 3, 300), 1)
+            with contextlib.closing(sqlite3.connect(auto_retry_stop.state_database())) as connection:
+                connection.execute("UPDATE retry_records SET last_seen = 0")
+                connection.commit()
+            self.assertIsNone(
+                auto_retry_stop.claim_next_attempt(scope, 3, 300, allow_create=False)
+            )
+            self.assertEqual(auto_retry_stop.claim_next_attempt(scope, 3, 300), 1)
+
+    def test_jitter_retry_after_and_invalid_env_never_break_cap(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_AUTO_RETRY_BASE_DELAY": "8",
+                "CODEX_AUTO_RETRY_MAX_DELAY": "10",
+                "CODEX_AUTO_RETRY_BACKOFF_FACTOR": "1.8",
+                "CODEX_AUTO_RETRY_JITTER": "5",
+            },
+            clear=False,
+        ), mock.patch.object(auto_retry_stop.random, "uniform", return_value=5.0):
+            self.assertEqual(auto_retry_stop.retry_delay(3, 9.0), 10.0)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "CODEX_AUTO_RETRY_BASE_DELAY": "1e308",
+                "CODEX_AUTO_RETRY_MAX_DELAY": "300",
+                "CODEX_AUTO_RETRY_BACKOFF_FACTOR": "inf",
+                "CODEX_AUTO_RETRY_JITTER": "nan",
+            },
+            clear=False,
+        ):
+            delay = auto_retry_stop.retry_delay(10)
+            self.assertTrue(math.isfinite(delay))
+            self.assertLessEqual(delay, 115.0)
+
+        with mock.patch.dict(
+            os.environ,
+            {"CODEX_AUTO_RETRY_MAX_DELAY": "0"},
+            clear=False,
+        ):
+            self.assertEqual(auto_retry_stop.retry_delay(1), 0.0)
+
+        with mock.patch.object(auto_retry_stop.time, "monotonic", return_value=30.0):
+            self.assertEqual(auto_retry_stop.fit_delay_to_hook_budget(115.0, 0.0), 85.0)
+
+    def test_retry_reason_requires_side_effect_checks(self) -> None:
+        detection = auto_retry_stop.classify_retryable_error(
+            "Codex model provider error: 503 service unavailable."
+        )
+        self.assertIsNotNone(detection)
+        reason = auto_retry_stop.build_retry_reason(detection, 1, 3, 8.0)
+        self.assertIn("不要重复已经成功", reason)
+        self.assertIn("外部系统", reason)
+        self.assertIn("无法", reason)
+        self.assertNotIn("请直接重试上一条用户请求", reason)
+        self.assertNotIn("不要向用户索要确认", reason)
+
+
+class PluginContractTests(unittest.TestCase):
+    def test_hook_config_uses_default_path_and_cross_platform_commands(self) -> None:
+        payload = json.loads(HOOKS.read_text(encoding="utf-8"))
+        group = payload["hooks"]["Stop"][0]
+        hook = group["hooks"][0]
+        self.assertNotIn("matcher", group)
+        self.assertIn("PLUGIN_ROOT", hook["command"])
+        self.assertIn("$env:PLUGIN_ROOT", hook["commandWindows"])
+        self.assertEqual(hook["timeout"], 120)
+        self.assertNotIn("async", hook)
+        self.assertTrue(hook["statusMessage"])
+
+    def test_manifest_and_marketplace_contract(self) -> None:
+        manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+        marketplace = json.loads(MARKETPLACE.read_text(encoding="utf-8"))
+        entry = marketplace["plugins"][0]
+
+        self.assertEqual(manifest["name"], PLUGIN.name)
+        self.assertRegex(
+            manifest["version"],
+            r"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$",
+        )
+        self.assertNotIn("hooks", manifest)
+        self.assertTrue(HOOKS.is_file())
+        self.assertEqual(entry["name"], manifest["name"])
+        self.assertEqual(entry["source"], {"source": "local", "path": "./plugins/codex-auto-retry"})
+        self.assertEqual(
+            entry["policy"],
+            {"installation": "AVAILABLE", "authentication": "ON_INSTALL"},
+        )
+        self.assertEqual(entry["category"], "Productivity")
+
+    def test_hook_command_runs_from_unicode_path(self) -> None:
+        hook = json.loads(HOOKS.read_text(encoding="utf-8"))["hooks"]["Stop"][0]["hooks"][0]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plugin_root = Path(temp_dir) / "插件 路径"
+            scripts_dir = plugin_root / "scripts"
+            scripts_dir.mkdir(parents=True)
+            shutil.copy2(SCRIPT, scripts_dir / SCRIPT.name)
+            env = hook_environment(Path(temp_dir) / "data")
+            env["PLUGIN_ROOT"] = str(plugin_root)
+            payload = json.dumps(latest_stop_payload(), ensure_ascii=False)
+
+            if os.name == "nt":
+                powershell = shutil.which("pwsh") or shutil.which("powershell")
+                if not powershell or not shutil.which("py"):
+                    self.skipTest("Windows PowerShell 或 Python launcher 不可用")
+                command = [powershell, "-NoProfile", "-NonInteractive", "-Command", hook["commandWindows"]]
+            else:
+                shell = shutil.which("sh")
+                if not shell or not shutil.which("python3"):
+                    self.skipTest("sh 或 python3 不可用")
+                command = [shell, "-c", hook["command"]]
+
+            result = subprocess.run(
+                command,
+                input=payload,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                check=False,
+                timeout=60,
+                env=env,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["decision"], "block")
 
 
 if __name__ == "__main__":

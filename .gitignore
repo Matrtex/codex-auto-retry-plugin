@@ -7,4 +7,6 @@ __pycache__/
 Thumbs.db
 .env
 state.json
+state-v2.sqlite3
+state-v2.sqlite3-*
 *.tmp
