@@ -2,14 +2,14 @@
 
 Codex Auto Retry 是一个本地 Codex 插件：当 `Stop` Hook 能看到明确的临时模型错误时，它按 turn 执行有限指数退避，并通过 continuation prompt 让 Codex 从失败点安全续跑。
 
-当前 `0.2.0` 已按 2026-08-20 发布的 Codex CLI `0.149.0` Hook 契约完成兼容改造。
+截至 2026-08-28，官方 Hooks 页面是当前发布行为参考，同日 changelog 中的最新稳定版为 Codex CLI `0.150.1`。当前 `0.2.0` 已按该 Hooks 页面复核；现有端到端实测基线仍是 `0.149.0`，尚未在 `0.150.1` 稳定版完成端到端实测。
 
 ## 先看能力边界
 
 这个插件不是底层 HTTP/Provider 重试器，也不能保证捕获所有 `429`、`5xx`、timeout 或 SSE/network hard failure。
 
 - `Stop` 触发时，插件可以检查 `last_assistant_message`。
-- 如果 Codex 内置重试后仍以 Provider sampling `Err` 结束，当前客户端不会运行 `Stop`，插件没有入口介入。
+- 若 Provider sampling hard failure 没有产生 `Stop`（`0.149.0` 实测存在此路径），插件没有入口介入。
 - 当前公开 Hook 事件中没有可供普通插件注册的 `ProviderError` 或 `TurnError`。
 - Codex 自身的 Provider、stream 和 network 恢复逻辑仍由客户端负责；本插件只是 `Stop` 可见错误的 fallback。
 
@@ -20,33 +20,39 @@ Codex Auto Retry 是一个本地 Codex 插件：当 `Stop` Hook 能看到明确�
 为降低普通回答误触发，除官方 high-demand、`rate_limit_exceeded`、`stream disconnected`、缺少 `response.completed` 等客户端强签名外，错误必须同时具有明确的运行时 error envelope、临时失败形态和 Codex/OpenAI/model provider 上下文：
 
 - `We're currently experiencing high demand...`
-- Provider `429`、`rate_limit_exceeded`、`too many requests`、`Retry-After`
-- Provider `500`、`502`、`503`、`504`、`529`、Cloudflare `520-524`
-- model stream/SSE 中断或缺少 `response.completed`
+- Provider HTTP `408`、`409`、`429`，以及 `rate_limit_exceeded`、`too many requests`
+- 带 Provider 上下文的全部 HTTP `500-599`
+- model stream/SSE 中断、缺少 `response.completed`，以及当前 Codex 的明确 stream/WebSocket 关闭签名
 - 带 Provider 上下文的 network、DNS、TLS、timeout、connection reset/refused
 - Provider 明确给出的 temporary/transient/try again 类错误
+
+以上是进入 `Stop` 可见文本后的候选分类范围，不表示对应底层 HTTP 或 network 错误一定会进入 `Stop`。
 
 这些错误不会续跑：
 
 - 用户主动中断或取消
-- `400`、`401`、`403`、`404`
+- 除 `408`、`409`、`429` 之外的 HTTP `4xx`
 - API key、authentication、permission
-- billing、余额、`insufficient_quota`、usage limit
+- billing、余额、`insufficient_quota`、spend/usage limit
 - context/token 长度限制
 - invalid request、model not found、unsupported model
 - content/safety policy
+- 证书过期、hostname mismatch、unknown CA 等 TLS 配置错误
+- `x-should-retry: false`；文本中的 `true` 不会覆盖永久错误排除规则
 - 项目自身的业务服务器、测试、命令或网络错误
+- 完整 Markdown 引用、inline code 或 fenced code block 中的错误字面量
 
 ## 工作原理
 
-Codex CLI `0.149.0` 的 `Stop` payload 包含 `session_id`、`turn_id`、`stop_hook_active` 和 `last_assistant_message`。插件按以下顺序处理：
+当前官方 Hook common input 提供 `session_id`；`Stop` 事件另外提供 `turn_id`、`stop_hook_active` 和 `last_assistant_message`。插件按以下顺序处理：
 
-1. 严格校验 Hook 事件和字段类型。
+1. 严格校验 Hook 事件和字段类型；缺少非空 `turn_id` 或布尔型 `stop_hook_active` 时直接 fail-open，不创建旧式无 turn 预算。
 2. 只扫描受限长度的 `last_assistant_message`；默认不读不稳定的 transcript。
 3. 先排除认证、权限、配额、请求和策略类永久错误，再匹配 Provider 临时错误。
 4. 用 `session_id + turn_id` 的 SHA-256 作为当前 turn 的重试作用域。
 5. 在 `PLUGIN_DATA` 下通过 SQLite 原子领取下一次尝试，确保 Windows 多进程下仍严格执行上限。
-6. 等待包含 `Retry-After`、指数退避和 jitter 的有界延迟，然后返回：
+6. 等待包含 `Retry-After`、指数退避和 jitter 的有界延迟；如果 Hook 剩余预算不足，会回滚本次 attempt，然后停止 continuation。
+7. 等待完成后返回：
 
 ```json
 {
@@ -55,7 +61,7 @@ Codex CLI `0.149.0` 的 `Stop` payload 包含 `session_id`、`turn_id`、`stop_h
 }
 ```
 
-`decision: "block"` 不会重放底层请求。Codex 会把 `reason` 创建为新的 continuation prompt，并继续同一个 turn；此时 `stop_hook_active` 会从 `false` 变为 `true`，`turn_id` 保持不变。
+`decision: "block"` 不会重放底层请求。Codex 会把 `reason` 创建为新的 continuation prompt，并继续当前 turn；此时 `stop_hook_active` 会从 `false` 变为 `true`。`turn_id` 在 `0.149.0` 端到端实测中沿用，当前实现以此作为同一 turn 共享预算的作用域假设。
 
 如果另一个匹配的 `Stop` Hook 返回 `continue: false`，官方优先级规则会阻止 continuation，本插件不能覆盖该决定。
 
@@ -75,9 +81,9 @@ Stop continuation 不是事务。模型响应失败时，之前的工具调用�
 
 先决条件：
 
-- Codex CLI `0.149.0` 已实测通过；后续版本仍需按当时的 Hook 契约复验。
+- Codex CLI `0.149.0` 已实测通过；截至 2026-08-28 已按当前官方 Hooks 发布行为页面复核，同日最新稳定版 `0.150.1` 尚未完成端到端实测。
 - Python `3.10+`，仅使用标准库。
-- Windows 需要 `py -3`；Linux/macOS 需要 `python3`。
+- Windows 需要 `py -3`，并应先运行 `py -3 --version` 确认版本不低于 `3.10`；Linux/macOS 需要 `python3`。
 
 从 GitHub marketplace 安装：
 
@@ -128,7 +134,7 @@ $env:CODEX_AUTO_RETRY_BASE_DELAY = "10"
 $env:CODEX_AUTO_RETRY_MAX_DELAY = "60"
 ```
 
-当错误文本包含数字形式的 `Retry-After` 时，插件会把它作为最低等待时间。如果该值超过 `CODEX_AUTO_RETRY_MAX_DELAY`、`115` 秒硬上限或当前 Hook 剩余时间，插件会停止 continuation，而不是提前重试。Hook timeout 是 `120` 秒，预留 `5` 秒用于进程启动、状态事务和输出。
+插件只能解析进入 `last_assistant_message`（或显式开启的 transcript fallback）文本中的 `Retry-After`，不能读取原始 HTTP header。支持秒数、`retry-after-ms`、HTTP-date，以及带引号或 JSON-like key 的等价文本；同一消息有多个有效提示时取最大值。该值是最低等待时间。如果它超过 `CODEX_AUTO_RETRY_MAX_DELAY`、`115` 秒硬上限或当前 Hook 剩余时间，插件会停止 continuation，而不是提前重试；已领取但尚未输出 continuation 的 attempt 会安全回滚。`x-should-retry: false` 始终阻止续跑。Hook timeout 是 `120` 秒，预留 `5` 秒用于进程启动、状态事务和输出。
 
 ## 状态与隐私
 
@@ -170,7 +176,7 @@ python -X utf8 (Join-Path $codexHome "skills\.system\plugin-creator\scripts\vali
 python -X utf8 (Join-Path $codexHome "skills\.system\skill-creator\scripts\quick_validate.py") "plugins\codex-auto-retry\skills\codex-auto-retry"
 ```
 
-CI 覆盖 Ubuntu/Windows 与 Python 3.10/3.13，包括最新 Stop payload、误报、退避边界、SQLite 并发、隐私和插件静态契约。
+CI 覆盖 Ubuntu/Windows 与 Python 3.10/3.13，包括当前公开 Stop 字段 fixture、永久错误与项目错误误报、Retry-After 边界、SQLite 并发、隐私和插件静态契约；它不等同于在每个 Codex CLI 版本上的端到端实测。
 
 ## 官方资料
 
@@ -179,6 +185,7 @@ CI 覆盖 Ubuntu/Windows 与 Python 3.10/3.13，包括最新 Stop payload、误�
 - [Hook 审查与信任](https://learn.chatgpt.com/docs/hooks#review-and-trust-hooks)
 - [Plugin-bundled hooks 与 PLUGIN_DATA](https://learn.chatgpt.com/docs/hooks#plugin-bundled-hooks)
 - [插件构建规则](https://developers.openai.com/plugins/build/plugins#bundled-mcp-servers-and-lifecycle-hooks)
+- [OpenAI API 错误码与重试建议](https://developers.openai.com/api/docs/guides/error-codes)
 - [Codex 更新日志](https://learn.chatgpt.com/docs/changelog)
 
 ## License

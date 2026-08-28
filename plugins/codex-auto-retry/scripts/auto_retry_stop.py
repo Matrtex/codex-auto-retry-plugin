@@ -13,6 +13,8 @@ import sqlite3
 import sys
 import time
 from dataclasses import dataclass
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Pattern
 
@@ -46,13 +48,108 @@ def compile_patterns(*patterns: str) -> tuple[Pattern[str], ...]:
     return tuple(re.compile(pattern, re.IGNORECASE | re.DOTALL) for pattern in patterns)
 
 
+RETRYABLE_HTTP_STATUSES = {408, 409, 429}
+HTTP_STATUS_PATTERNS = compile_patterns(
+    r"(?<![\w])\"?(?:http(?:/\d(?:\.\d)?)?(?:[\s_-]+status)?|"
+    r"status(?:[\s_-]+code)?|error[\s_-]+code)\"?\s*[:=]?\s*(\d{3})\b",
+    r"(?<![\w])\"?response[\s_-]+code\"?\s*[:=]?\s*(\d{3})"
+    r"(?=\s*(?:$|[,;:.)}\]\-\{\[\"']|bad request|unauthorized|forbidden|not found|"
+    r"method not allowed|request timeout|conflict|unprocessable entity|too many requests|"
+    r"internal server error|bad gateway|service unavailable|gateway timeout|overloaded|"
+    r"(?:(?:[a-z0-9]+[_-])+(?:error|exceeded|limit|unavailable|timeout|conflict|locked)|"
+    r"request_timed_out|bad_gateway|connection_timed_out)\b))",
+    r"\b(?:request failed(?:\s+with|\s*[:=])|failed with|returned|responded with)\s*[:=]?\s*"
+    r"(?:http(?:[\s_-]+status)?\s*)?(\d{3})(?=\s*(?:$|[,;:.)}\]\-\{\[\"']|"
+    r"bad request|unauthorized|forbidden|not found|request timeout|conflict|unprocessable entity|"
+    r"too many requests|internal server error|bad gateway|service unavailable|gateway timeout|"
+    r"overloaded|(?:(?:[a-z0-9]+[_-])+(?:error|exceeded|limit|unavailable|timeout|conflict|locked)|"
+    r"request_timed_out|bad_gateway|connection_timed_out)\b))",
+)
+X_SHOULD_RETRY_FALSE_PATTERN = re.compile(
+    r"\bx[\s_-]+should[\s_-]+retry\b[\"']?\s*[:=]\s*[\"']?"
+    r"(?:false|0|no)[\"']?(?!\w)",
+    re.IGNORECASE,
+)
+PROVIDER_CONTEXT_PATTERN = re.compile(
+    r"\b(?:codex|openai|chatgpt|model provider|model service|responses api|"
+    r"api\.openai\.com|chatgpt\.com)\b",
+    re.IGNORECASE,
+)
+RUNTIME_ERROR_PREFIX_FRAGMENT = (
+    r"^\s*(?:[#>*`!\-]+\s*)?(?:(?:error|fatal)\s*:\s*)?"
+)
+GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT = (
+    RUNTIME_ERROR_PREFIX_FRAGMENT + r"provider\s+(?:error|failure)\s*:\s*"
+)
+TRAILING_PROVIDER_RELATION_FRAGMENT = (
+    r"\b(?:(?:from|by|to)\b|(?:while|when)\b.{0,40}\b"
+    r"(?:calling|contacting|waiting for|reading from|sending to|connecting to)\b)"
+)
+PROVIDER_CONNECTION_FAILURE_FRAGMENT = (
+    r"(?:(?:could not|cannot|unable to|was unable to)\s+(?:be\s+)?"
+    r"(?:contact(?:ed)?|connect(?:ed)?(?:\s+to)?)|"
+    r"was not\s+(?:contacted|connected))"
+)
+PROVIDER_RUNTIME_ENVELOPE_FRAGMENT = (
+    r"(?:codex(?:\s+model provider)?|openai(?:\s+(?:api|model provider))?|"
+    r"chatgpt|model provider|model service|responses api)\b(?:"
+    r"\s*(?:(?::|-)\s*)?(?:error|fatal)\b(?=\s*(?::|-|code\b|[45]\d{2}\b))|"
+    r".{0,80}\b(?:request|response|stream|connection|operation|call)\b.{0,40}"
+    r"\b(?:error|failed|failure|timed out|timeout)\b|"
+    r".{0,80}\b(?:returned|responded(?: with)?|received|got|failed|timed out)\b|"
+    r".{0,80}\b"
+    + PROVIDER_CONNECTION_FAILURE_FRAGMENT
+    + r"\b)"
+)
+RUNTIME_STATUS_ENVELOPE_PATTERN = re.compile(
+    r"^\s*(?:[#>*`!\-]+\s*)?(?:"
+    r"(?:error|fatal)\s*:\s*(?:codex|openai(?: api)?|chatgpt|model provider|model service|responses api)\b"
+    r".{0,60}\b(?:http(?:/\d(?:\.\d)?)?(?:[\s_-]+status)?|"
+    r"status(?:[\s_-]+code)?|error[\s_-]+code|response[\s_-]+code)\b|"
+    r"(?:codex|openai(?: api)?|chatgpt|model provider|model service|responses api)\b\s*"
+    r"(?:http(?:/\d(?:\.\d)?)?(?:[\s_-]+status)?|status(?:[\s_-]+code)?|"
+    r"error[\s_-]+code|response[\s_-]+code)\b\s*[:=]|"
+    r"(?:(?:error|fatal)\s*:\s*)?"
+    r"(?:codex|openai(?: api)?|chatgpt|model provider|model service|responses api)\b.{0,100}"
+    r"\b(?:failed|returned|responded|received|got)\b)",
+    re.IGNORECASE,
+)
+EXPLICIT_PROVIDER_ENDPOINT_PATTERN = re.compile(
+    r"\b(?:api\.openai\.com|chatgpt\.com)\b",
+    re.IGNORECASE,
+)
+LOCAL_TARGET_FRAGMENT = (
+    r"(?:localhost|127\.0\.0\.1|::1|docker|mcp(?: server)?|database|postgres(?:ql)?|"
+    r"mysql|redis|kubernetes|kubectl|github|gitlab|stripe)"
+)
+LOCAL_SYSTEM_ERROR_PATTERNS = compile_patterns(
+    rf"(?<![\w]){LOCAL_TARGET_FRAGMENT}(?![\w])"
+    r"(?:(?!\b(?:codex|openai|chatgpt|model provider|responses api)\b).){0,100}"
+    r"\b(?:connection failed|connection refused|connection reset|request timed out|timed out|"
+    r"timeout|error while reading (?:the )?server response|service unavailable|server error|"
+    r"network error|(?:returned|responded with|status(?: code)?)\s*[:=]?\s*"
+    r"(?:http\s*)?[45]\d{2})\b",
+    r"\b(?:connection failed|connection refused|connection reset|request timed out|timed out|"
+    r"error while reading (?:the )?server response|network error)\b\s*"
+    rf"(?:to|for|with|from|by|:)\s*.{{0,100}}(?<![\w]){LOCAL_TARGET_FRAGMENT}(?![\w])",
+)
+PROVIDER_NEGATION_PATTERNS = compile_patterns(
+    r"\b(?:codex|openai|chatgpt|model provider|responses api)\b.{0,100}"
+    r"\b(?:(?:was not|is not|not|was never)\s+(?:called|involved)|"
+    r"is (?:healthy|unrelated)|(?:was|is|were|are) not affected|completed normally|succeeded)\b",
+    r"\b(?:not called|not involved|unrelated|before calling)\b.{0,100}"
+    r"\b(?:codex|openai|chatgpt|model provider|responses api)\b",
+)
+
+
 RETRYABLE_RULES: tuple[tuple[str, str, tuple[Pattern[str], ...]], ...] = (
     (
         "high_demand",
         "Codex/OpenAI 服务高负载",
         compile_patterns(
             r"\bwe(?:'|’)?re currently experiencing high demand(?:,? which may cause temporary errors?)?",
-            r"\b(?:codex|openai|chatgpt|model provider|provider service|upstream service|model service)\b"
+            r"\bselected model is at capacity\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b"
             r".{0,120}\b(?:high demand|overloaded|over capacity|at capacity|capacity constraints?)\b",
         ),
     ),
@@ -60,72 +157,156 @@ RETRYABLE_RULES: tuple[tuple[str, str, tuple[Pattern[str], ...]], ...] = (
         "rate_limit",
         "模型服务限流",
         compile_patterns(
-            r"\b(?:codex|openai|model provider|provider|upstream|responses api)\b"
-            r".{0,180}\b(?:429|rate[-_ ]?limit(?:ed|ing|_exceeded)?|too many requests|throttl(?:ed|ing|e))\b",
-            r"\b(?:429|rate[-_ ]?limit(?:ed|ing|_exceeded)?|too many requests|throttl(?:ed|ing|e))\b"
-            r".{0,180}\b(?:codex|openai|model provider|provider|upstream|responses api)\b",
-            r"\b(?:http|status(?: code)?)\s*[:=]?\s*429\b"
-            r".{0,160}\b(?:codex|openai|model provider|provider|upstream|responses api)\b",
-            r"\brate_limit_exceeded\b.{0,120}\b(?:openai|codex|provider|request|retry-after|error)\b",
+            GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT
+            + r".{0,100}\b(?:429|rate[-_ ]?limit(?:ed|ing|_exceeded)?|"
+            r"rate[_ -]?limit[_ -]?error|too many requests|throttled)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b"
+            r".{0,180}\b(?:rate[-_ ]?limit(?:ed|ing|_exceeded)?|rate[_ -]?limit[_ -]?error|"
+            r"too many requests|throttl(?:ed|ing|e))\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:rate[-_ ]?limit(?:ed|ing|_exceeded)?|rate[_ -]?limit[_ -]?error|"
+            r"too many requests|throttl(?:ed|ing|e))\b"
+            r".{0,100}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:http|status(?: code)?)\s*[:=]?\s*429\b.{0,80}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,80}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            r"\brate_limit_exceeded\b.{0,120}\b(?:openai|codex|model provider|model service|request|retry-after|error)\b",
         ),
     ),
     (
         "server_error",
         "模型上游服务错误",
         compile_patterns(
-            r"\b(?:codex|openai|model provider|provider|upstream)\b.{0,180}"
-            r"\b(?:500|502|503|504|520|521|522|523|524|529|internal server error|bad gateway|"
+            GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT
+            + r".{0,100}\b(?:5\d{2}|internal server error|bad gateway|service unavailable|"
+            r"gateway timeout|server_error|internal_error|internal[_ -]?server[_ -]?error|"
+            r"service_unavailable|overloaded_error)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
+            r"\b(?:internal server error|bad gateway|"
             r"service unavailable|gateway timeout|server had an error|temporar(?:y|ily) unavailable)\b",
-            r"\b(?:500|502|503|504|520|521|522|523|524|529|internal server error|bad gateway|"
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
+            r"\b(?:server_error|internal_error|internal[_ -]?server[_ -]?error|"
+            r"service_unavailable|temporarily_unavailable|"
+            r"overloaded_error)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:internal server error|bad gateway|"
             r"service unavailable|gateway timeout|server had an error|temporar(?:y|ily) unavailable)\b"
-            r".{0,180}\b(?:codex|openai|model provider|provider|upstream)\b",
-            r"\b(?:http|status(?: code)?)\s*[:=]?\s*(?:500|502|503|504|520|521|522|523|524|529)\b"
-            r".{0,180}\b(?:codex|openai|model provider|provider|upstream)\b",
+            r".{0,100}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:http|status(?:[\s_-]+code)?)\s*[:=]?\s*5\d{2}\b.{0,80}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,80}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
         ),
     ),
     (
         "stream_error",
         "模型流式响应中断",
         compile_patterns(
+            GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT
+            + r".{0,100}\b(?:stream_error|stream_disconnected|response_stream_disconnected|"
+            r"stream(?:ing)? (?:failed|interrupted|ended|closed))\b",
             r"\bstream disconnected before completion\b",
+            r"\bresponse stream disconnected\b",
+            r"^\s*(?:error\s*:\s*)?response stream (?:connection failed|failed|interrupted)\b",
+            r"\bstream closed before response\.completed\b",
+            r"\bwebsocket closed by server before response\.completed\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
+            r"\b(?:stream_error|stream_disconnected|response_stream_disconnected)\b",
             r"\bresponse\.completed\b.{0,100}\b(?:missing|not received|never received)\b",
-            r"\b(?:codex|openai|model provider|provider|upstream|sse|eventsource)\b.{0,160}"
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,160}"
             r"\b(?:stream(?:ing)? (?:error|failed|interrupted|ended|closed)|failed to stream|"
             r"response (?:was )?(?:interrupted|truncated|cut off))\b",
-            r"\b(?:stream(?:ing)? (?:error|failed|interrupted|ended|closed)|failed to stream|"
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:stream(?:ing)? (?:error|failed|interrupted|ended|closed)|failed to stream|"
             r"response (?:was )?(?:interrupted|truncated|cut off))\b.{0,180}"
-            r"\b(?:codex|openai|model provider|provider|upstream|sse|eventsource)\b",
-            r"\b(?:connection|socket)\b.{0,100}\b(?:reset|closed|aborted|interrupted|hang up)\b"
-            r".{0,120}\b(?:codex|openai|model provider|provider|upstream)\b",
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:connection|socket)\b.{0,100}\b(?:reset|closed|aborted|interrupted|hang up)\b.{0,80}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,80}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
         ),
     ),
     (
         "network_error",
         "模型请求网络错误",
         compile_patterns(
-            r"\b(?:codex|openai|model provider|provider|upstream|responses api)\b.{0,180}"
+            GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT
+            + r".{0,100}\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|"
+            r"ENOTFOUND|request_timeout|request_timed_out|connection_error|connection_timeout|"
+            r"api[_ -]?connection[_ -]?error|api[_ -]?timeout[_ -]?error)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
             r"\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b",
-            r"\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b.{0,180}"
-            r"\b(?:codex|openai|model provider|provider|upstream|responses api)\b",
-            r"\b(?:codex|openai|model provider|provider|upstream|responses api)\b.{0,180}"
-            r"\b(?:network (?:error|failure|timeout)|request (?:timed out|timeout|failed)|fetch failed|"
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
+            r"\b(?:request_timeout|request_timed_out|connection[_ -]?(?:error|timeout)|"
+            r"api[_ -]?connection[_ -]?error|api[_ -]?timeout[_ -]?error)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}\b"
+            + PROVIDER_CONNECTION_FAILURE_FRAGMENT
+            + r"\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\bdns.{0,40}(?:timeout|failed|error)\b.{0,40}\bfor\s+"
+            r"(?:api\.openai\.com|chatgpt\.com)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b.{0,180}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:api[_ -]?connection[_ -]?error|api[_ -]?timeout[_ -]?error)\b.{0,180}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
+            r"\b(?:network (?:error|failure|timeout)|request (?:timed out|timeout)|"
+            r"connection[_ -]?(?:error|timeout)|connection failed|"
+            r"error while reading the server response|fetch failed|"
             r"connection (?:timed out|refused|reset|aborted)|tls handshake (?:failed|error)|"
             r"dns.{0,40}(?:timeout|failed|error))\b",
-            r"\b(?:network (?:error|failure|timeout)|request (?:timed out|timeout|failed)|fetch failed|"
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:network (?:error|failure|timeout)|request (?:timed out|timeout)|connection failed|"
+            r"error while reading the server response|fetch failed|"
             r"connection (?:timed out|refused|reset|aborted)|tls handshake (?:failed|error)|"
-            r"dns.{0,40}(?:timeout|failed|error))\b.{0,180}"
-            r"\b(?:codex|openai|model provider|provider|upstream|responses api)\b",
+            r"dns.{0,40}(?:timeout|failed|error))\b.{0,100}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\brequest failed\b.{0,80}\b(?:while|when)\b.{0,40}"
+            r"\b(?:calling|contacting|sending to|connecting to)\b.{0,40}"
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,80}"
+            r"\b(?:ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|"
+            r"api[_ -]?connection[_ -]?error|api[_ -]?timeout[_ -]?error)\b",
+        ),
+    ),
+    (
+        "request_error",
+        "模型请求临时失败",
+        compile_patterns(
+            GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT
+            + r".{0,100}\bconflict[_ -]?error\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b"
+            r".{0,180}\bconflict[_ -]?error\b",
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\bconflict[_ -]?error\b.{0,100}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
         ),
     ),
     (
         "temporary_error",
         "模型服务临时错误",
         compile_patterns(
-            r"\b(?:codex|openai|model provider|provider|upstream service|model service)\b.{0,180}"
+            GENERIC_PROVIDER_ERROR_PREFIX_FRAGMENT
+            + r".{0,100}\b(?:temporary|transient)\b.{0,40}\b(?:error|failure|unavailable)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
             r"\b(?:temporary|transient)\b.{0,60}\b(?:error|failure|unavailable)\b",
-            r"\b(?:temporary|transient)\b.{0,60}\b(?:error|failure|unavailable)\b.{0,180}"
-            r"\b(?:codex|openai|model provider|provider|upstream service|model service)\b",
-            r"\b(?:codex|openai|model provider|provider|upstream)\b.{0,180}"
+            RUNTIME_ERROR_PREFIX_FRAGMENT
+            + r"\b(?:temporary|transient)\b.{0,60}\b(?:error|failure|unavailable)\b.{0,180}"
+            + TRAILING_PROVIDER_RELATION_FRAGMENT
+            + r".{0,100}\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b",
+            r"\b(?:codex|openai|chatgpt|model provider|model service|responses api)\b.{0,180}"
             r"\b(?:please retry|try again (?:later|shortly|in a few)|operation timed out|something went wrong)\b",
         ),
     ),
@@ -135,17 +316,43 @@ NON_RETRYABLE_PATTERNS = compile_patterns(
     r"\bturn_aborted\b",
     r"\b(?:user|the user) (?:interrupted|cancelled|canceled|aborted)\b",
     r"\binterrupted the previous turn on purpose\b",
-    r"\b(?:http(?: status)?|status(?: code)?|error(?: code)?|code)\s*[:=]?\s*(?:400|401|403|404)\b",
+    r"\b(?:response|stream|request|turn)\b.{0,80}\b(?:interrupted|cancelled|canceled|aborted)\b"
+    r".{0,50}\b(?:by user|user|ctrl[- ]?c|sigint|manually)\b",
+    r"\b(?:by user|ctrl[- ]?c|sigint|manually)\b.{0,50}\b(?:interrupted|cancelled|canceled|aborted)\b",
+    r"\b(?:http(?:[\s_-]+status)?|status(?:[\s_-]+code)?|error(?:[\s_-]+code)?|code)\s*[:=]?\s*(?:400|401|403|404|405|406|407|410|411|412|413|414|415|416|417|418|421|422|423|424|425|426|428|431|451|499)\b",
     r"\b(?:bad request|not found)\b",
+    r"\bbad[_ -]?request[_ -]?error\b",
+    r"\bpermission[_ -]?denied[_ -]?error\b",
+    r"\bnot[_ -]?found[_ -]?error\b",
+    r"\bunprocessable[_ -]?entity[_ -]?error\b",
     r"\bpermission denied\b",
     r"\bforbidden\b",
     r"\bunauthorized\b",
     r"\binvalid[_ -]?api[_ -]?key\b",
     r"\bincorrect api key\b",
     r"\bauthentication (?:failed|required|error)\b",
+    r"\bauthentication[_ -]?(?:failed|required|error)\b",
+    r"\b(?:failed|could not|unable) to authenticate\b",
+    r"\b(?:login required|access denied|account (?:disabled|deactivated|suspended))\b",
+    r"\b(?:api key|bearer token|oauth token|access token)\b.{0,40}"
+    r"\b(?:expired|invalid|revoked|missing)\b",
+    r"\b(?:certificate (?:verify failed|(?:has |is )?expired|revoked|(?:is )?not yet valid)|"
+    r"certificate[_ -]?verify[_ -]?failed|cert[_ -]?has[_ -]?expired|self[- _]?signed[- _]?certificate|"
+    r"hostname mismatch|ip address mismatch|unknown ca|unable to get local issuer certificate|"
+    r"unable to verify the first certificate|unable_to_verify_leaf_signature|"
+    r"err_tls_cert_altname_invalid|certificate required)\b",
+    r"\bpermission[_ -]denied\b",
+    r"\b(?:invalid[_ -]?request(?:[_ -]?error)?|invalid[_ -]?json|malformed[_ -]?request)\b",
+    r"\b(?:model[_ -]?not[_ -]?found|unsupported[_ -]?model)\b",
+    r"\b(?:content[_ -]?policy[_ -]?violation|safety[_ -]?violation|policy[_ -]?violation)\b",
+    r"\b(?:context[_ -]?length[_ -]?exceeded|maximum[_ -]?context[_ -]?length|prompt[_ -]?too[_ -]?long)\b",
     r"\binsufficient[_ -]?quota\b",
-    r"\bquota exceeded\b",
-    r"\b(?:billing|payment required|usage limit|credits? exhausted)\b",
+    r"\b(?:quota[_ -]?exceeded|usage[_ -]?limit[_ -]?reached|billing[_ -]?hard[_ -]?limit[_ -]?reached)\b",
+    r"\b(?:(?:monthly[_ -]?)?budget[_ -]?exceeded|hard[_ -]?limit[_ -]?reached|"
+    r"billing[_ -]?not[_ -]?active|(?:account|organization)[_ -]?deactivated|"
+    r"insufficient[_ -]?funds)\b",
+    r"\b(?:credit[_ -]?balance[_ -]?exhausted|credits? exhausted|organization[_ -]?spend[_ -]?limit[_ -]?exceeded|project[_ -]?spend[_ -]?limit[_ -]?exceeded|organization[_ -]?usage[_ -]?limit[_ -]?exceeded)\b",
+    r"\b(?:billing|payment required|payment_required|spend limit|usage limit)\b",
     r"\bcontext length\b",
     r"\bmaximum context\b",
     r"\bprompt too long\b",
@@ -156,19 +363,21 @@ NON_RETRYABLE_PATTERNS = compile_patterns(
     r"\bmalformed\b",
     r"\binvalid request\b",
     r"\bvalidation error\b",
+    r"\b(?:validation[_ -]?error|unprocessable[_ -]?entity|content[_ -]?filter|refusal)\b",
     r"\bunsupported\b",
-    r"\bmodel not found\b",
 )
 
 QUOTE_EXPLANATION_PATTERNS = compile_patterns(
-    r"\b(?:means|refers to|for example|example|how to)\b",
+    r"\b(?:means|refers to|for example|examples?|samples?|fixtures?|test cases?|test data|"
+    r"diagnosis|diagnostic|reporting|how to)\b",
     r"\berror handling\b",
     r"\b(?:one )?possible (?:error )?(?:string|message|response)\b",
     r"\bexact (?:provider )?(?:message|error|string)\b",
     r"\b(?:is|are|was|were) (?:emitted|returned|shown|reported|documented|used)\b",
     r"\b(?:occurs|happens) when\b",
-    r"\b(?:can|may|could|should)\b.{0,80}"
-    r"\b(?:occur|happen|be handled|be mitigated|be resolved|retry|back off)\b",
+    r"\b(?:can|may|could)\b.{0,80}"
+    r"\b(?:occur|happen|be handled|be mitigated|be resolved|back off)\b",
+    r"\bshould\b.{0,80}\b(?:be handled|be mitigated|be resolved|back off)\b",
     r"\bto (?:resolve|troubleshoot|handle|mitigate|fix)\b",
     r"\bduring (?:scheduled )?maintenance\b",
     r"(?:例如|示例|如何处理|处理方法|解决方法|可通过|应该|可能发生)",
@@ -181,37 +390,82 @@ GENERIC_EXPLANATION_PATTERNS = compile_patterns(
 
 ERROR_ENVELOPE_PATTERN = re.compile(
     r"^\s*(?:[#>*`!\-]+\s*)?(?:"
-    r"(?:error|fatal)\b|(?:an?\s+)?error occurred\b|something went wrong\b|"
-    r"(?:codex|openai(?: api)?|model provider|provider|upstream)\b.{0,100}"
-    r"\b(?:error|failed|failure|timed out|timeout|"
-    r"rate_limit_exceeded|too many requests|throttled|ECONNRESET|ECONNREFUSED|ECONNABORTED|"
-    r"ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b|"
+    r"(?:error|fatal)\b|provider\s+(?:error|failure)\s*:|"
+    r"(?:an?\s+)?error occurred\b|something went wrong\b|"
+    + PROVIDER_RUNTIME_ENVELOPE_FRAGMENT
+    + r"|"
     r"(?:the\s+)?(?:request|response|stream|connection|socket)\b.{0,80}"
     r"\b(?:error|failed|failure|interrupted|disconnected|closed|reset|aborted|timed out|timeout)\b|"
     r"we(?:'|’)?re currently experiencing high demand\b|"
+    r"selected model is at capacity\b|"
     r"stream disconnected before completion\b|"
+    r"stream closed before response\.completed\b|"
+    r"websocket closed by server before response\.completed\b|"
+    r"connection failed\b|"
+    r"error while reading the server response\b|"
+    r"request timed out\b|"
     r"response\.completed\b.{0,60}\b(?:missing|not received|never received)\b|"
     r"(?:rate_limit_exceeded|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b|"
     r"(?:unexpected\s+)?(?:http\s+)?status(?:\s+code)?\s*[:=]?\s*"
-    r"(?:429|500|502|503|504|520|521|522|523|524|529)\b)",
+    r"(?:4\d{2}|5\d{2})\b|"
+    r"http(?:/\d(?:\.\d)?)?\s+(?:4\d{2}|5\d{2})\b)",
+    re.IGNORECASE,
+)
+LEADING_ERROR_ONLY_PATTERN = re.compile(
+    r"^\s*(?:[#>*`!\-]+\s*)?(?:error|fatal)\s*:\s*$",
+    re.IGNORECASE,
+)
+MODEL_PROVIDER_AT_MATCH_END_PATTERN = re.compile(
+    r"\b(?:codex|openai|chatgpt|model provider|model service|responses api|"
+    r"api\.openai\.com|chatgpt\.com)\b\s*$",
+    re.IGNORECASE,
+)
+PROVIDER_EXPLANATION_TAIL_PATTERN = re.compile(
+    r"^\s*(?:documentation|docs?|readme|api\s+reference|reference|catalog|"
+    r"sdk\s+(?:docs?|documentation|reference)|integration\s+tests?|"
+    r"appears?\s+in\s+(?:the\s+)?readme)\b",
     re.IGNORECASE,
 )
 
 STRONG_ERROR_ENVELOPE_PATTERN = re.compile(
     r"^\s*(?:[#>*`!\-]+\s*)?(?:"
-    r"(?:error|fatal)\b|(?:an?\s+)?error occurred\b|something went wrong\b|"
-    r"(?:codex|openai(?: api)?|model provider|provider|upstream)\b.{0,100}"
-    r"\b(?:error|failed|failure|timed out|timeout|rate_limit_exceeded|too many requests|throttled|"
-    r"ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b|"
+    r"(?:error|fatal)\b|provider\s+(?:error|failure)\s*:|"
+    r"(?:an?\s+)?error occurred\b|something went wrong\b|"
+    + PROVIDER_RUNTIME_ENVELOPE_FRAGMENT
+    + r"|"
     r"(?:the\s+)?(?:request|response|stream|connection|socket)\b.{0,80}"
     r"\b(?:error|failed|failure|interrupted|disconnected|closed|reset|aborted|timed out|timeout)\b|"
     r"(?:rate_limit_exceeded|ECONNRESET|ECONNREFUSED|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND)\b|"
+    r"(?:selected model is at capacity|stream closed before response\.completed|"
+    r"websocket closed by server before response\.completed|connection failed|"
+    r"error while reading the server response|request timed out)\b|"
     r"(?:unexpected\s+)?(?:http\s+)?status(?:\s+code)?\s*[:=]?\s*"
-    r"(?:429|500|502|503|504|520|521|522|523|524|529)\b)",
+    r"(?:4\d{2}|5\d{2})\b|"
+    r"http(?:/\d(?:\.\d)?)?\s+(?:4\d{2}|5\d{2})\b)",
     re.IGNORECASE,
 )
 
-RETRY_AFTER_PATTERN = re.compile(r"\bretry-after\s*[:=]\s*(\d+(?:\.\d+)?)", re.IGNORECASE)
+RETRY_AFTER_NUMBER_PATTERN = re.compile(
+    r"\bretry[\s_-]+after(?![\s_-]*ms)\b[\"']?\s*[:=]\s*[\"']?"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)[\"']?(?![\w.])",
+    re.IGNORECASE,
+)
+RETRY_AFTER_MS_PATTERN = re.compile(
+    r"\bretry[\s_-]+after[\s_-]+ms\b[\"']?\s*[:=]\s*[\"']?"
+    r"([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)[\"']?(?![\w.])",
+    re.IGNORECASE,
+)
+RETRY_AFTER_DATE_PATTERN = re.compile(
+    r"\bretry[\s_-]+after(?![\s_-]*ms)\b[\"']?\s*[:=]\s*[\"']?("
+    r"[A-Za-z]{3},\s+\d{1,2}\s+[A-Za-z]{3}\s+\d{4}\s+\d{2}:\d{2}:\d{2}\s+(?:GMT|UTC)|"
+    r"[A-Za-z]{6,9},\s+\d{1,2}-[A-Za-z]{3}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+(?:GMT|UTC)|"
+    r"[A-Za-z]{3}\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})[\"']?",
+    re.IGNORECASE,
+)
+RETRY_AFTER_HEADER_PREFIX_PATTERN = re.compile(
+    r"^\s*(?:[\{\[]\s*)?[\"']?retry[\s_-]+after(?:[\s_-]+ms)?\b",
+    re.IGNORECASE,
+)
 
 CONTROL_EVENT_TYPES = {
     "hook_prompt",
@@ -226,6 +480,9 @@ SELF_RETRY_PATTERNS = compile_patterns(
     r"hook_run_id=.*codex-auto-retry",
     r"<hook_prompt\b",
 )
+FENCED_CODE_PATTERN = re.compile(r"^\s*```[\s\S]*```\s*$")
+INLINE_CODE_PATTERN = re.compile(r"^\s*`[^`\r\n]+`\s*$")
+BOLD_ERROR_PATTERN = re.compile(r"^\s*\*\*(?:error|fatal)\s*:?\*\*", re.IGNORECASE)
 
 TEXT_CONTAINER_KEYS = {
     "content",
@@ -237,6 +494,7 @@ TEXT_CONTAINER_KEYS = {
     "detail",
     "details",
 }
+SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?:[.!?;]\s+|[。！？；](?=\S)|[\r\n]+)")
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -292,34 +550,167 @@ def is_self_retry_text(text: str) -> bool:
     return has_any(SELF_RETRY_PATTERNS, text)
 
 
+def is_markdown_quoted_error(text: str) -> bool:
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if FENCED_CODE_PATTERN.fullmatch(stripped) or INLINE_CODE_PATTERN.fullmatch(stripped):
+        return True
+    lines = [line for line in stripped.splitlines() if line.strip()]
+    if lines and all(line.lstrip().startswith(">") for line in lines):
+        return True
+    return BOLD_ERROR_PATTERN.search(stripped) is not None
+
+
 def make_snippet(text: str, match: re.Match[str], radius: int = 180) -> str:
     start = max(0, match.start() - radius)
     end = min(len(text), match.end() + radius)
     return normalize_text(text[start:end])
 
 
+def extract_http_statuses(text: str) -> list[int]:
+    statuses: list[int] = []
+    for pattern in HTTP_STATUS_PATTERNS:
+        for match in pattern.finditer(text):
+            try:
+                statuses.append(int(match.group(1)))
+            except (TypeError, ValueError):
+                continue
+    return statuses
+
+
+def split_message_segments(text: str) -> list[str]:
+    """按明确语句边界切分，避免前一段错误为后一段说明文字提供信封。"""
+    return [
+        normalized
+        for segment in SENTENCE_BOUNDARY_PATTERN.split(text)
+        if (normalized := normalize_text(segment))
+    ]
+
+
+def provider_http_statuses(text: str) -> list[int]:
+    statuses: list[int] = []
+    for segment in split_message_segments(text):
+        statuses.extend(provider_http_statuses_in_segment(segment))
+    return statuses
+
+
+def provider_http_statuses_in_segment(segment: str) -> list[int]:
+    if (
+        PROVIDER_CONTEXT_PATTERN.search(segment)
+        and RUNTIME_STATUS_ENVELOPE_PATTERN.search(segment)
+    ):
+        return extract_http_statuses(segment)
+    return []
+
+
 def parse_retry_after(text: str) -> float | None:
-    match = RETRY_AFTER_PATTERN.search(text)
-    if not match:
-        return None
-    try:
-        value = float(match.group(1))
-    except ValueError:
-        return None
-    if value < 0:
-        return None
-    return value if math.isfinite(value) else math.inf
+    values: list[float] = []
+
+    for pattern, divisor in (
+        (RETRY_AFTER_MS_PATTERN, 1000.0),
+        (RETRY_AFTER_NUMBER_PATTERN, 1.0),
+    ):
+        for match in pattern.finditer(text):
+            try:
+                value = float(match.group(1)) / divisor
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if value < 0:
+                continue
+            values.append(value if math.isfinite(value) else math.inf)
+
+    for match in RETRY_AFTER_DATE_PATTERN.finditer(text):
+        try:
+            parsed = parsedate_to_datetime(match.group(1))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            value = parsed.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError, IndexError):
+            continue
+        if value >= 0:
+            values.append(value if math.isfinite(value) else math.inf)
+
+    return max(values) if values else None
+
+
+def retry_after_for_segment(segments: list[str], index: int) -> float | None:
+    """仅关联命中句段及相邻的独立 Retry-After 字段，避免其它系统污染等待时间。"""
+    related = [segments[index]]
+
+    before = index - 1
+    while before >= 0 and RETRY_AFTER_HEADER_PREFIX_PATTERN.search(segments[before]):
+        related.insert(0, segments[before])
+        before -= 1
+
+    after = index + 1
+    while after < len(segments) and RETRY_AFTER_HEADER_PREFIX_PATTERN.search(segments[after]):
+        related.append(segments[after])
+        after += 1
+
+    return parse_retry_after(" ".join(related))
+
+
+def match_has_runtime_envelope(segment: str, match: re.Match[str]) -> bool:
+    """要求命中片段自身具备运行时证据，防止借用同句中的本地 Error。"""
+    matched_text = match.group(0)
+    if (
+        MODEL_PROVIDER_AT_MATCH_END_PATTERN.search(matched_text)
+        and PROVIDER_EXPLANATION_TAIL_PATTERN.search(segment[match.end() :])
+    ):
+        return False
+    if ERROR_ENVELOPE_PATTERN.search(matched_text) or provider_http_statuses(matched_text):
+        return True
+    return LEADING_ERROR_ONLY_PATTERN.fullmatch(segment[: match.start()]) is not None
 
 
 def classify_retryable_error(text: str) -> Detection | None:
+    if is_markdown_quoted_error(text):
+        return None
+
     normalized = normalize_text(text)
     if not normalized or is_self_retry_text(normalized):
+        return None
+
+    if X_SHOULD_RETRY_FALSE_PATTERN.search(normalized):
+        return None
+
+    if has_any(PROVIDER_NEGATION_PATTERNS, normalized):
+        return None
+
+    if (
+        has_any(LOCAL_SYSTEM_ERROR_PATTERNS, normalized)
+        and EXPLICIT_PROVIDER_ENDPOINT_PATTERN.search(normalized) is None
+    ):
         return None
 
     if has_any(NON_RETRYABLE_PATTERNS, normalized):
         return None
 
-    if not ERROR_ENVELOPE_PATTERN.search(normalized):
+    statuses = extract_http_statuses(normalized)
+    if any(400 <= status < 500 and status not in RETRYABLE_HTTP_STATUSES for status in statuses):
+        return None
+    message_segments = split_message_segments(text)
+    provider_status_entries = [
+        (index, segment, segment_statuses)
+        for index, segment in enumerate(message_segments)
+        if (segment_statuses := provider_http_statuses_in_segment(segment))
+    ]
+    provider_statuses = [
+        status
+        for _, _, segment_statuses in provider_status_entries
+        for status in segment_statuses
+    ]
+    runtime_segments = [
+        (index, segment)
+        for index, segment in enumerate(message_segments)
+        if (
+            ERROR_ENVELOPE_PATTERN.search(segment)
+            or provider_http_statuses_in_segment(segment)
+        )
+    ]
+
+    if not runtime_segments and not provider_statuses:
         return None
 
     if has_any(QUOTE_EXPLANATION_PATTERNS, normalized):
@@ -330,16 +721,54 @@ def classify_retryable_error(text: str) -> Detection | None:
     ):
         return None
 
-    for category, label, patterns in RETRYABLE_RULES:
-        for pattern in patterns:
-            match = pattern.search(normalized)
-            if match:
-                return Detection(
-                    category=category,
-                    label=label,
-                    snippet=make_snippet(normalized, match),
-                    retry_after_seconds=parse_retry_after(normalized),
-                )
+    if any(status == 429 for status in provider_statuses):
+        index, segment, _ = next(
+            entry for entry in provider_status_entries if 429 in entry[2]
+        )
+        return Detection(
+            category="rate_limit",
+            label="模型服务限流",
+            snippet=normalize_text(segment[:360]),
+            retry_after_seconds=retry_after_for_segment(message_segments, index),
+        )
+    if any(500 <= status <= 599 for status in provider_statuses):
+        index, segment, _ = next(
+            entry
+            for entry in provider_status_entries
+            if any(500 <= status <= 599 for status in entry[2])
+        )
+        return Detection(
+            category="server_error",
+            label="模型上游服务错误",
+            snippet=normalize_text(segment[:360]),
+            retry_after_seconds=retry_after_for_segment(message_segments, index),
+        )
+    if any(status in {408, 409} for status in provider_statuses):
+        index, segment, _ = next(
+            entry for entry in provider_status_entries if any(status in {408, 409} for status in entry[2])
+        )
+        return Detection(
+            category="request_error",
+            label="模型请求临时失败",
+            snippet=normalize_text(segment[:360]),
+            retry_after_seconds=retry_after_for_segment(message_segments, index),
+        )
+
+    for segment_index, segment in runtime_segments:
+        for category, label, patterns in RETRYABLE_RULES:
+            for pattern in patterns:
+                match = pattern.search(segment)
+                if match and match_has_runtime_envelope(segment, match):
+                    return Detection(
+                        category=category,
+                        label=label,
+                        snippet=make_snippet(segment, match),
+                        retry_after_seconds=retry_after_for_segment(
+                            message_segments,
+                            segment_index,
+                        ),
+                    )
+
     return None
 
 
@@ -456,11 +885,9 @@ def state_database() -> Path:
 
 
 def retry_scope_hash(session_id: str, turn_id: str, detection: Detection) -> str:
-    if turn_id:
-        source = f"v2\0{session_id}\0{turn_id}"
-    else:
-        legacy_error_hash = hashlib.sha256(detection.snippet.encode("utf-8")).hexdigest()
-        source = f"legacy\0{session_id}\0{detection.category}\0{legacy_error_hash}"
+    if not turn_id:
+        raise ValueError("turn_id must not be empty")
+    source = f"v2\0{session_id}\0{turn_id}"
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
@@ -492,6 +919,10 @@ def claim_next_attempt(
                     last_seen INTEGER NOT NULL CHECK(last_seen >= 0)
                 )
                 """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS retry_records_last_seen_idx "
+                "ON retry_records(last_seen)"
             )
             connection.commit()
             connection.execute("BEGIN IMMEDIATE")
@@ -550,6 +981,48 @@ def claim_next_attempt(
     except (OSError, OverflowError, sqlite3.Error, TypeError, ValueError):
         # 状态不可用时不自动续跑，避免失去次数上限。
         return None
+
+
+def release_claim(scope_hash: str, attempt: int) -> bool:
+    """回滚尚未形成 continuation 的最后一次领取，避免无效消耗预算。"""
+    if attempt <= 0:
+        return False
+
+    now = int(time.time())
+    try:
+        connection = sqlite3.connect(
+            str(state_database()),
+            timeout=SQLITE_BUSY_TIMEOUT_SECONDS,
+        )
+        try:
+            connection.execute(f"PRAGMA busy_timeout = {int(SQLITE_BUSY_TIMEOUT_SECONDS * 1000)}")
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempts FROM retry_records WHERE scope_hash = ?",
+                (scope_hash,),
+            ).fetchone()
+            if row is None or type(row[0]) is not int or row[0] != attempt:
+                connection.commit()
+                return False
+
+            if attempt == 1:
+                connection.execute(
+                    "DELETE FROM retry_records WHERE scope_hash = ? AND attempts = ?",
+                    (scope_hash, attempt),
+                )
+            else:
+                connection.execute(
+                    "UPDATE retry_records SET attempts = ?, last_seen = ? "
+                    "WHERE scope_hash = ? AND attempts = ?",
+                    (attempt - 1, now, scope_hash, attempt),
+                )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+    except (OSError, OverflowError, sqlite3.Error, TypeError, ValueError):
+        # 并发领取已经推进时不回退，宁可少重试一次也不制造重复 attempt。
+        return False
 
 
 def configured_max_delay() -> float:
@@ -626,18 +1099,16 @@ def main() -> int:
         return 0
 
     session_id = payload.get("session_id")
-    turn_id = payload.get("turn_id", "")
+    turn_id = payload.get("turn_id")
     stop_hook_active = payload.get("stop_hook_active")
     last_message_value = payload.get("last_assistant_message")
     transcript_path_value = payload.get("transcript_path")
 
     if not isinstance(session_id, str) or not session_id.strip():
         return 0
-    if not isinstance(turn_id, str):
+    if not isinstance(turn_id, str) or not turn_id.strip():
         return 0
-    if stop_hook_active is not None and not isinstance(stop_hook_active, bool):
-        return 0
-    if stop_hook_active is not None and not turn_id.strip():
+    if not isinstance(stop_hook_active, bool):
         return 0
     if last_message_value is not None and not isinstance(last_message_value, str):
         return 0
@@ -684,7 +1155,7 @@ def main() -> int:
         minimum=300,
         maximum=7 * 24 * 60 * 60,
     )
-    scope_hash = retry_scope_hash(session_id, turn_id.strip(), detection)
+    scope_hash = retry_scope_hash(session_id.strip(), turn_id.strip(), detection)
     attempt = claim_next_attempt(
         scope_hash,
         max_attempts,
@@ -699,8 +1170,9 @@ def main() -> int:
         started_at,
     )
     if detection.retry_after_seconds is not None and delay < detection.retry_after_seconds:
+        release_claim(scope_hash, attempt)
         return 0
-    if not env_bool("CODEX_AUTO_RETRY_DISABLE_SLEEP") and delay > 0:
+    if delay > 0:
         time.sleep(delay)
 
     print(
